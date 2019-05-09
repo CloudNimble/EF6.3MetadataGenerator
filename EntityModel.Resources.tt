@@ -1,0 +1,138 @@
+﻿<#@ template debug="true" hostSpecific="true" #>
+<#@ assembly name="EnvDTE" #>
+<#@ assembly name="System.Core" #>
+<#@ assembly name="System.Data.Linq" #>
+<#@ assembly name="System.Xml" #>
+<#@ assembly name="System.Xml.Linq" #>
+
+<#@ import namespace="EnvDTE" #>
+<#@ import namespace="System" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="System.IO" #> 
+<#@ import namespace="System.Linq" #> 
+<#@ import namespace="System.Xml" #> 
+<#@ import namespace="System.Xml.Linq" #> 
+<#@ output extension=".cs" #>
+<#
+
+	var visualStudio = (this.Host as IServiceProvider).GetService(typeof(DTE)) as DTE;
+ 	Project project = visualStudio.Solution.FindProjectItem(this.Host.TemplateFile).ContainingProject as Project;
+
+	var edmxFileName = "EntityModel.edmx";
+	var edmxPath = this.Host.ResolvePath(edmxFileName);
+	var edmxFileNameWithoutExtension = Path.GetFileNameWithoutExtension(edmxPath);
+	var projectPath = Path.GetDirectoryName(edmxPath);
+	var csdlPath = edmxFileNameWithoutExtension + ".csdl";
+	var mslPath = edmxFileNameWithoutExtension + ".msl";
+	var ssdlPath = edmxFileNameWithoutExtension + ".ssdl";
+
+	var resourcePaths = new List<string> {csdlPath, mslPath, ssdlPath};
+
+	project.Save(project.FullName);
+	//RWM: Sleep so that the save can finish and the file can be reopened.
+	System.Threading.Thread.Sleep(350);
+
+	//RWM: Split the EDMX file and write out the three different resource files.
+	var nodes = GetSectionsFromEdmx(edmxPath);
+	XmlToString(nodes.Csdl, Path.Combine(projectPath, csdlPath));
+	XmlToString(nodes.Msl, Path.Combine(projectPath, mslPath));
+	XmlToString(nodes.Ssdl, Path.Combine(projectPath, ssdlPath));
+
+	//RWM: First use the Host to make sure the project items are the right type, so they get embedded as a resource.
+	var projectItems = GetProjectItemsRecursive(project.ProjectItems).Where(c => c.Name.StartsWith("EntityModel"));
+	foreach (ProjectItem item in projectItems.Where(c => resourcePaths.Contains(c.Name)))
+	{
+		item.Properties.Item("ItemType").Value = "EmbeddedResource";
+	}
+	//RWM: Then remove the model and diagram so you can edit them.
+	//foreach (ProjectItem item in projectItems.Where(c => !resourcePaths.Contains(c.Name) && !c.Name.EndsWith(".tt")))
+	//{
+	//	item.Remove();
+	//}
+
+	project.Save(project.FullName);
+	//RWM: Sleep so that the save can finish and the file can be reopened.
+	System.Threading.Thread.Sleep(350);
+
+	//RWM: You have to jump through a bunch more hoops to add a LogicalResource, so we'll just manipulate the project file instead.
+	var projectFile = XDocument.Load(project.FileName);
+    var resources = projectFile.Root.Descendants().Where(c => c.Name.LocalName == "EmbeddedResource" && c.Attributes("Include").Any(d => resourcePaths.Contains(d.Value)));
+    foreach (var item in resources)
+    {
+        var referenceName = item.Attributes().FirstOrDefault(c => c.Name == "Include");
+        if (!item.Descendants().Any(c => c.Name == "LogicalName"))
+        {
+            item.Add(new XElement("LogicalName", referenceName.Value));
+        }
+		if (!item.Descendants().Any(c => c.Name == "DependentUpon"))
+        {
+			item.Add(new XElement("DependentUpon", "EntityModel.Resources.tt"));
+		}
+    }
+	File.WriteAllText(project.FileName, projectFile.ToString(SaveOptions.None));
+#>
+<#+
+    const string EdmxUri = "http://schemas.microsoft.com/ado/2009/11/edmx";
+    const string CsdlUri = "http://schemas.microsoft.com/ado/2009/11/edm";
+    const string MslUri = "http://schemas.microsoft.com/ado/2009/11/mapping/cs";
+    const string SsdlUri = "http://schemas.microsoft.com/ado/2009/11/edm/ssdl";
+
+    public MetadataResult GetSectionsFromEdmx(string edmxPath)
+    {
+        var xmlDocument = new XmlDocument();
+        using (XmlReader xmlReader = XmlReader.Create(edmxPath))
+        {
+            xmlDocument.Load(xmlReader);
+        }
+        var xmlNamespaceManagers = new XmlNamespaceManager(xmlDocument.NameTable);
+        xmlNamespaceManagers.AddNamespace("edmx", EdmxUri);
+        xmlNamespaceManagers.AddNamespace("edm", CsdlUri);
+        xmlNamespaceManagers.AddNamespace("ssdl", SsdlUri);
+        xmlNamespaceManagers.AddNamespace("map", MslUri);
+
+        var csdl = (XmlElement)xmlDocument.SelectSingleNode("/edmx:Edmx/edmx:Runtime/edmx:ConceptualModels/edm:Schema", xmlNamespaceManagers);
+        var ssdl = (XmlElement)xmlDocument.SelectSingleNode("/edmx:Edmx/edmx:Runtime/edmx:StorageModels/ssdl:Schema", xmlNamespaceManagers);
+        var msl = (XmlElement)xmlDocument.SelectSingleNode("/edmx:Edmx/edmx:Runtime/edmx:Mappings/map:Mapping", xmlNamespaceManagers);
+
+        return new MetadataResult(csdl, msl, ssdl);
+    }
+
+	public static void XmlToString(XmlElement node, string fileName)
+	{
+		var result = string.Empty;
+        var doc = new XmlDocument();
+        doc.AppendChild(doc.ImportNode(node, true));
+		doc.Save(fileName);
+	}
+
+	public List<EnvDTE.ProjectItem> GetProjectItemsRecursive(ProjectItems items)
+ 	{
+     	var results = new List<ProjectItem>();
+     	if (items == null) return results;
+     	foreach(EnvDTE.ProjectItem item in items)
+     	{
+       		results.Add(item);
+       		results.AddRange(GetProjectItemsRecursive(item.ProjectItems));
+     	}
+     	return results;
+ 	}
+
+	public class MetadataResult
+    {
+
+        public XmlElement Csdl { get; set; }
+
+        public XmlElement Msl { get; set; }
+
+        public XmlElement Ssdl { get; set; }
+
+        public MetadataResult(XmlElement csdl, XmlElement msl, XmlElement ssdl)
+        {
+            Csdl = csdl;
+            Msl = msl;
+            Ssdl = ssdl;
+        }
+
+    }
+
+#>
